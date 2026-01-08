@@ -3,12 +3,14 @@
 A modular Express backend that powers a deterministic, stateful intake assistant for law firms. It combines a finite state machine (FSM) dialogue engine with controlled LLM assists for classification, question phrasing, and summaries, while persisting structured data and audit trails to Postgres.
 
 ## Architecture
-- **Express API** with `routes/`, `services/`, `prompts/`, and `db/` for clear separation.
+- **Express API** with `routes/`, `services/`, `prompts/`, `db/`, and `middleware/` for clear separation.
+- **Multi-tenant isolation** via `tenant_id` across sessions, messages, intakes, consent records, and lead scores.
 - **FSM dialog engine** in `services/dialogService.js` drives deterministic consent → identity → jurisdiction → description → urgency → case-specific questions → summary/confirmation → done.
-- **LLM assist (optional)** in `services/llmService.js` for case-type classification, question phrasing, and compact summaries. Output is schema-validated before use.
-- **Postgres schema** via `db/migrations/001_init.sql` with `sessions`, `messages`, `intakes`, `consents`, `session_transitions`, and `lead_scores` tables.
+- **LLM assist (optional)** in `services/llmService.js` for case-type classification, question phrasing, and compact summaries. Output is schema-validated before use with retry guards.
+- **Postgres schema** via `db/migrations/001_init.sql` with `tenants`, `sessions`, `messages`, `intakes`, `consents`, `session_transitions`, and `lead_scores` tables.
 - **Lead scoring** in `services/leadScoring.js` produces rule-based scoring and ML-ready factors for routing.
 - **Voice adapter skeleton** under `/voice` that produces TwiML and reuses the same FSM via `/dialog`.
+- **Structured logging** with request/tenant/session correlation via `services/logger.js`.
 
 ## Setup
 1. Install dependencies:
@@ -28,13 +30,30 @@ A modular Express backend that powers a deterministic, stateful intake assistant
 
 For local development without Postgres, the app falls back to an in-memory pg-mem database so migrations and tests still pass.
 
+## Tenancy & Authentication
+Each request must include tenant-bound API key headers:
+- `x-tenant-id`: UUID of the tenant (law firm)
+- `x-api-key`: API key issued for the tenant
+- `x-role`: `system`, `tenant_admin`, or `operator` (defaults to `tenant_admin`)
+
+The `tenants` table stores the API key hash and retention policy. Rotate keys by updating `api_key_hash` and deactivating tenants via the `status` column.
+
+## Rate Limiting
+In-memory rate limiting is applied per tenant + IP with separate limits:
+- `/dialog`: 60 requests/min
+- `/voice`: 30 requests/min
+- `/submit`: 20 requests/min
+- `/session`: 30 requests/min
+
+These limits are enforced in `middleware/rateLimit.js` and can be adjusted for production infrastructure.
+
 ## API
 ### POST /dialog
 Body: `{ session_id?: string, text: string }`
 Returns session, reply, current state, detected case type, extracted and missing fields, lead score/tier/routing, and `done` flag. Creates a new session if `session_id` is absent. Missing `text` yields `400 {"error":"Missing text"}`.
 
 ### GET /session/:id
-Returns the session snapshot (session row, intake row, messages, transitions). Useful for debugging.
+Returns the session snapshot (session row, intake row, messages, transitions, consent records, lead scores). Useful for debugging and audits.
 
 ### POST /submit/:id
 Marks the intake as submitted (`submitted_to_make=true`) and returns the snapshot (future webhook hook).
@@ -60,20 +79,44 @@ Marks the intake as submitted (`submitted_to_make=true`) and returns the snapsho
 ## Lead Scoring
 Rule-based scoring derives `lead_score`, `lead_tier`, and `lead_routing` from case type, urgency, jurisdiction, and monetary indicators. The factors JSON keeps ML-ready features for future models.
 
-## Logging & Compliance
-- Structured JSON logs with session correlation (no PII in logs).
+## Compliance & Retention
 - Consent-first intake, auditable transitions, and clear separation of channel adapters.
+- Soft-delete fields (`deleted_at`) on tenant-scoped tables for retention workflows.
+- Tenant-level `retention_days` stored in `tenants` to drive future purge jobs and DSGVO requests.
+
+## Production Readiness
+- Structured JSON logs with request/tenant/session correlation (no PII in logs).
+- Schema-validated LLM responses with retry protection.
+- Rate limiting for abuse prevention.
+- Error responses include stable `code` fields for auditability.
 
 ## Testing
-Jest + Supertest cover validation, happy-path flows, and voice adapter behavior. Run:
+Jest + Supertest cover validation helpers, dialog flow, consent/abort, session persistence, and voice adapter behavior. Run:
 ```bash
 npm test
 ```
 
 ## Curl Examples
-- Start a new dialog: `curl -X POST http://localhost:3000/dialog -H 'Content-Type: application/json' -d '{"text":"ja"}'`
-- Continue with a session: `curl -X POST http://localhost:3000/dialog -H 'Content-Type: application/json' -d '{"session_id":"<id>","text":"Max Mustermann"}'`
-- Inspect session: `curl http://localhost:3000/session/<id>`
+- Start a new dialog:
+  ```bash
+  curl -X POST http://localhost:3000/dialog \
+    -H 'Content-Type: application/json' \
+    -H 'x-tenant-id: <tenant-id>' \
+    -H 'x-api-key: <api-key>' \
+    -d '{"text":"ja"}'
+  ```
+- Continue with a session:
+  ```bash
+  curl -X POST http://localhost:3000/dialog \
+    -H 'Content-Type: application/json' \
+    -H 'x-tenant-id: <tenant-id>' \
+    -H 'x-api-key: <api-key>' \
+    -d '{"session_id":"<id>","text":"Max Mustermann"}'
+  ```
+- Inspect session:
+  ```bash
+  curl -H 'x-tenant-id: <tenant-id>' -H 'x-api-key: <api-key>' http://localhost:3000/session/<id>
+  ```
 
 ## Prompts
 - `prompts/classify_case_type.prompt` – strict JSON classification for case type.

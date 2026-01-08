@@ -10,9 +10,10 @@ import {
   extractJurisdiction,
   normalizeUrgency
 } from '../utils/validation.js';
-import { UserError } from '../utils/errors.js';
-import { logger } from './logger.js';
+import { UserError, SystemError } from '../utils/errors.js';
+import { getContext, logger } from './logger.js';
 import { computeLeadScore } from './leadScoring.js';
+import { metrics } from './metrics.js';
 
 const STATES = {
   CONSENT: 'CONSENT',
@@ -56,36 +57,51 @@ const CASE_QUESTIONS = {
 
 const MAX_RETRIES = 2;
 
-async function ensureSession(sessionId) {
+async function ensureSession(sessionId, tenantId) {
   const pool = getPool();
   const id = sessionId || uuidv4();
-  const { rows } = await pool.query('SELECT * FROM sessions WHERE id=$1', [id]);
+  const { rows } = await pool.query('SELECT * FROM sessions WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL', [
+    id,
+    tenantId
+  ]);
   if (rows.length) return rows[0];
-  await pool.query('INSERT INTO sessions (id, state, status) VALUES ($1,$2,$3)', [id, STATES.CONSENT, 'active']);
+  if (sessionId) {
+    throw new UserError('Session not found', 404, {}, 'SESSION_NOT_FOUND');
+  }
+  await pool.query('INSERT INTO sessions (id, tenant_id, state, status) VALUES ($1,$2,$3,$4)', [
+    id,
+    tenantId,
+    STATES.CONSENT,
+    'active'
+  ]);
   await pool.query(
-    'INSERT INTO intakes (session_id, data, missing_fields, confidence) VALUES ($1,$2,$3,$4)',
-    [id, JSON.stringify({ _meta: { retries: {} } }), JSON.stringify([]), JSON.stringify({})]
+    'INSERT INTO intakes (session_id, tenant_id, data, missing_fields, confidence) VALUES ($1,$2,$3,$4,$5)',
+    [id, tenantId, JSON.stringify({ _meta: { retries: {} } }), JSON.stringify([]), JSON.stringify({})]
   );
-  await recordTransition(id, null, STATES.CONSENT, 'session_created');
-  return (await pool.query('SELECT * FROM sessions WHERE id=$1', [id])).rows[0];
+  await recordTransition(id, tenantId, null, STATES.CONSENT, 'session_created');
+  return (
+    await pool.query('SELECT * FROM sessions WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL', [id, tenantId])
+  ).rows[0];
 }
 
-async function appendMessage(sessionId, role, text) {
+async function appendMessage(sessionId, tenantId, role, text) {
   const pool = getPool();
-  await pool.query('INSERT INTO messages (id, session_id, role, text) VALUES ($1,$2,$3,$4)', [
+  await pool.query('INSERT INTO messages (id, tenant_id, session_id, role, text) VALUES ($1,$2,$3,$4,$5)', [
     uuidv4(),
+    tenantId,
     sessionId,
     role,
     text
   ]);
 }
 
-async function recordConsent({ sessionId, consented, channel, consentText, ipAddress, userAgent }) {
+async function recordConsent({ sessionId, tenantId, consented, channel, consentText, ipAddress, userAgent }) {
   const pool = getPool();
   await pool.query(
-    'INSERT INTO consents (id, session_id, channel, consent_text, consented, consented_at, ip_address, user_agent) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+    'INSERT INTO consents (id, tenant_id, session_id, channel, consent_text, consented, consented_at, ip_address, user_agent) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)',
     [
       uuidv4(),
+      tenantId,
       sessionId,
       channel || 'api',
       consentText,
@@ -97,11 +113,11 @@ async function recordConsent({ sessionId, consented, channel, consentText, ipAdd
   );
 }
 
-async function recordTransition(sessionId, fromState, toState, reason) {
+async function recordTransition(sessionId, tenantId, fromState, toState, reason) {
   const pool = getPool();
   await pool.query(
-    'INSERT INTO session_transitions (id, session_id, from_state, to_state, reason) VALUES ($1,$2,$3,$4,$5)',
-    [uuidv4(), sessionId, fromState, toState, reason]
+    'INSERT INTO session_transitions (id, tenant_id, session_id, from_state, to_state, reason) VALUES ($1,$2,$3,$4,$5,$6)',
+    [uuidv4(), tenantId, sessionId, fromState, toState, reason]
   );
 }
 
@@ -124,24 +140,20 @@ function updateMissingFields(intake, state, caseType) {
   return missing;
 }
 
-function getRetryCount(intake, key) {
-  return intake?.data?._meta?.retries?.[key] || 0;
-}
-
 async function incrementRetry(sessionId, intake, key) {
   const meta = intake.data?._meta || { retries: {} };
   const retries = { ...(meta.retries || {}) };
   retries[key] = (retries[key] || 0) + 1;
-  await updateIntake(sessionId, { data: { ...(intake.data || {}), _meta: { ...meta, retries } } });
+  await updateIntake(sessionId, { data: { ...(intake.data || {}), _meta: { ...meta, retries } } }, intake.tenant_id);
   return retries[key];
 }
 
-async function handleConsent({ text, session, intake, context }) {
+async function handleConsent({ text, session, intake, context, tenantId }) {
   const consentText = 'Ich stimme der Verarbeitung meiner Angaben gemäß DSGVO zu.';
   if (isNegative(text)) {
-    await recordConsent({ sessionId: session.id, consented: false, consentText, ...context });
-    await updateSessionState(session.id, STATES.DONE, 'consent_declined');
-    await finalizeSession(session.id, 'abgelehnt');
+    await recordConsent({ sessionId: session.id, tenantId, consented: false, consentText, ...context });
+    await updateSessionState(session.id, tenantId, STATES.DONE, 'consent_declined');
+    await finalizeSession(session.id, tenantId, 'abgelehnt');
     return {
       reply_text: 'Alles klar, wir beenden hier. Danke für Ihre Zeit.',
       state: STATES.DONE,
@@ -149,9 +161,9 @@ async function handleConsent({ text, session, intake, context }) {
     };
   }
   if (isAffirmative(text)) {
-    await updateIntake(session.id, { consent_given: true, consent_at: new Date().toISOString() });
-    await recordConsent({ sessionId: session.id, consented: true, consentText, ...context });
-    await updateSessionState(session.id, STATES.NAME, 'consent_accepted');
+    await updateIntake(session.id, { consent_given: true, consent_at: new Date().toISOString() }, tenantId);
+    await recordConsent({ sessionId: session.id, tenantId, consented: true, consentText, ...context });
+    await updateSessionState(session.id, tenantId, STATES.NAME, 'consent_accepted');
     return { reply_text: 'Vielen Dank. Wie ist Ihr vollständiger Name?', state: STATES.NAME };
   }
   return {
@@ -160,7 +172,7 @@ async function handleConsent({ text, session, intake, context }) {
   };
 }
 
-async function handleName({ text, session, intake }) {
+async function handleName({ text, session, intake, tenantId }) {
   const name = normalizeName(text);
   if (!name || name.length < 3) {
     const retries = await incrementRetry(session.id, intake, 'name');
@@ -169,22 +181,22 @@ async function handleName({ text, session, intake }) {
     }
     return { reply_text: 'Ich habe den Namen nicht verstanden. Bitte wiederholen Sie ihn.', state: STATES.NAME };
   }
-  await updateIntake(session.id, { name });
-  await updateSessionState(session.id, STATES.NAME_CONFIRM, 'name_captured');
+  await updateIntake(session.id, { name }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.NAME_CONFIRM, 'name_captured');
   return { reply_text: `Habe ich richtig verstanden, Ihr Name ist ${name}? (ja/nein)`, state: STATES.NAME_CONFIRM };
 }
 
-async function handleNameConfirm({ text, session }) {
+async function handleNameConfirm({ text, session, tenantId }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.PHONE, 'name_confirmed');
+    await updateSessionState(session.id, tenantId, STATES.PHONE, 'name_confirmed');
     return { reply_text: 'Bitte nennen Sie Ihre Telefonnummer (z. B. +49171...).', state: STATES.PHONE };
   }
-  await updateIntake(session.id, { name: null });
-  await updateSessionState(session.id, STATES.NAME, 'name_rejected');
+  await updateIntake(session.id, { name: null }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.NAME, 'name_rejected');
   return { reply_text: 'Bitte nennen Sie Ihren vollständigen Namen.', state: STATES.NAME };
 }
 
-async function handlePhone({ text, session, intake }) {
+async function handlePhone({ text, session, intake, tenantId }) {
   const phone = extractPhone(text);
   if (!phone) {
     const retries = await incrementRetry(session.id, intake, 'phone');
@@ -193,18 +205,18 @@ async function handlePhone({ text, session, intake }) {
     }
     return { reply_text: 'Die Nummer wirkt nicht gültig. Bitte erneut angeben.', state: STATES.PHONE };
   }
-  await updateIntake(session.id, { phone });
-  await updateSessionState(session.id, STATES.PHONE_CONFIRM, 'phone_captured');
+  await updateIntake(session.id, { phone }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.PHONE_CONFIRM, 'phone_captured');
   return { reply_text: `Ist ${phone} korrekt? (ja/nein)`, state: STATES.PHONE_CONFIRM };
 }
 
-async function handlePhoneConfirm({ text, session }) {
+async function handlePhoneConfirm({ text, session, tenantId }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.EMAIL, 'phone_confirmed');
+    await updateSessionState(session.id, tenantId, STATES.EMAIL, 'phone_confirmed');
     return { reply_text: 'Bitte nennen Sie Ihre E-Mail-Adresse. Falls keine vorhanden, schreiben Sie "keine".', state: STATES.EMAIL };
   }
-  await updateIntake(session.id, { phone: null });
-  await updateSessionState(session.id, STATES.PHONE, 'phone_rejected');
+  await updateIntake(session.id, { phone: null }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.PHONE, 'phone_rejected');
   return { reply_text: 'Bitte wiederholen Sie Ihre Telefonnummer.', state: STATES.PHONE };
 }
 
@@ -212,11 +224,11 @@ function isNoEmail(text) {
   return /keine|kein|nicht vorhanden|habe keine/i.test(text || '');
 }
 
-async function handleEmail({ text, session, intake }) {
+async function handleEmail({ text, session, intake, tenantId }) {
   if (isNoEmail(text)) {
     const data = { ...(intake.data || {}), email_missing_reason: 'keine' };
-    await updateIntake(session.id, { email: null, data });
-    await updateSessionState(session.id, STATES.JURISDICTION, 'email_skipped');
+    await updateIntake(session.id, { email: null, data }, tenantId);
+    await updateSessionState(session.id, tenantId, STATES.JURISDICTION, 'email_skipped');
     return { reply_text: 'Verstanden. In welchem Bundesland (Jurisdiktion) ist der Fall?', state: STATES.JURISDICTION };
   }
   const email = extractEmail(text);
@@ -227,22 +239,22 @@ async function handleEmail({ text, session, intake }) {
     }
     return { reply_text: 'Die E-Mail-Adresse wirkt nicht gültig. Bitte erneut angeben.', state: STATES.EMAIL };
   }
-  await updateIntake(session.id, { email });
-  await updateSessionState(session.id, STATES.EMAIL_CONFIRM, 'email_captured');
+  await updateIntake(session.id, { email }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.EMAIL_CONFIRM, 'email_captured');
   return { reply_text: `Ist ${email} korrekt? (ja/nein)`, state: STATES.EMAIL_CONFIRM };
 }
 
-async function handleEmailConfirm({ text, session }) {
+async function handleEmailConfirm({ text, session, tenantId }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.JURISDICTION, 'email_confirmed');
+    await updateSessionState(session.id, tenantId, STATES.JURISDICTION, 'email_confirmed');
     return { reply_text: 'In welchem Bundesland (Jurisdiktion) ist der Fall?', state: STATES.JURISDICTION };
   }
-  await updateIntake(session.id, { email: null });
-  await updateSessionState(session.id, STATES.EMAIL, 'email_rejected');
+  await updateIntake(session.id, { email: null }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.EMAIL, 'email_rejected');
   return { reply_text: 'Bitte nennen Sie Ihre E-Mail-Adresse.', state: STATES.EMAIL };
 }
 
-async function handleJurisdiction({ text, session, intake }) {
+async function handleJurisdiction({ text, session, intake, tenantId }) {
   const jurisdiction = extractJurisdiction(text);
   if (!jurisdiction) {
     const retries = await incrementRetry(session.id, intake, 'jurisdiction');
@@ -251,25 +263,25 @@ async function handleJurisdiction({ text, session, intake }) {
     }
     return { reply_text: 'Ich habe das Bundesland nicht erkannt. Bitte erneut angeben.', state: STATES.JURISDICTION };
   }
-  await updateIntake(session.id, { jurisdiction });
-  await updateSessionState(session.id, STATES.DESCRIPTION, 'jurisdiction_captured');
+  await updateIntake(session.id, { jurisdiction }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.DESCRIPTION, 'jurisdiction_captured');
   return { reply_text: 'Bitte schildern Sie kurz Ihr Anliegen.', state: STATES.DESCRIPTION };
 }
 
-async function handleDescription({ text, session, intake }) {
+async function handleDescription({ text, session, intake, tenantId }) {
   const description = text.trim();
   if (!description) {
     return { reply_text: 'Bitte schildern Sie Ihr Anliegen mit wenigen Sätzen.', state: STATES.DESCRIPTION };
   }
   const data = { ...(intake.data || {}), description };
   const classification = await classifyCaseType(description);
-  await updateIntake(session.id, { data, case_type: classification.case_type, confidence: classification });
-  await updateSession(session.id, { state: STATES.URGENCY, case_type: classification.case_type });
-  await recordTransition(session.id, STATES.DESCRIPTION, STATES.URGENCY, 'description_captured');
+  await updateIntake(session.id, { data, case_type: classification.case_type, confidence: classification }, tenantId);
+  await updateSession(session.id, tenantId, { state: STATES.URGENCY, case_type: classification.case_type });
+  await recordTransition(session.id, tenantId, STATES.DESCRIPTION, STATES.URGENCY, 'description_captured');
   return { reply_text: 'Wie dringend ist die Angelegenheit? (niedrig/mittel/hoch)', state: STATES.URGENCY };
 }
 
-async function handleUrgency({ text, session, intake }) {
+async function handleUrgency({ text, session, intake, tenantId }) {
   const urgency = normalizeUrgency(text);
   if (!urgency) {
     const retries = await incrementRetry(session.id, intake, 'urgency');
@@ -278,8 +290,8 @@ async function handleUrgency({ text, session, intake }) {
     }
     return { reply_text: 'Ich habe die Dringlichkeit nicht verstanden. Bitte erneut angeben.', state: STATES.URGENCY };
   }
-  await updateIntake(session.id, { urgency });
-  await updateSessionState(session.id, STATES.CASE_DETAILS, 'urgency_captured');
+  await updateIntake(session.id, { urgency }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.CASE_DETAILS, 'urgency_captured');
   const nextQuestion = await nextCaseQuestion(intake.case_type, intake.data || {});
   return { reply_text: nextQuestion, state: STATES.CASE_DETAILS };
 }
@@ -296,7 +308,7 @@ async function nextCaseQuestion(caseType, data = {}) {
   return question;
 }
 
-async function handleCaseDetails({ text, session, intake }) {
+async function handleCaseDetails({ text, session, intake, tenantId }) {
   const caseType = intake.case_type || 'other';
   const data = { ...(intake.data || {}) };
   const caseFields = CASE_FIELDS[caseType] || [];
@@ -306,26 +318,26 @@ async function handleCaseDetails({ text, session, intake }) {
       break;
     }
   }
-  await updateIntake(session.id, { data });
+  await updateIntake(session.id, { data }, tenantId);
   const missing = caseFields.filter((f) => !data[f]);
   if (missing.length === 0) {
-    await updateSessionState(session.id, STATES.SUMMARY, 'case_details_complete');
-    return await buildSummaryResponse({ session, intake: { ...intake, data } });
+    await updateSessionState(session.id, tenantId, STATES.SUMMARY, 'case_details_complete');
+    return await buildSummaryResponse({ session, intake: { ...intake, data }, tenantId });
   }
   return { reply_text: await nextCaseQuestion(caseType, data), state: STATES.CASE_DETAILS };
 }
 
-async function buildSummaryResponse({ session, intake }) {
+async function buildSummaryResponse({ session, intake, tenantId }) {
   const summaryPayload = await buildFinalSummary({ ...intake, data: intake.data });
-  await updateIntake(session.id, { summary: summaryPayload.summary });
-  await updateSessionState(session.id, STATES.SUMMARY_CONFIRM, 'summary_built');
+  await updateIntake(session.id, { summary: summaryPayload.summary }, tenantId);
+  await updateSessionState(session.id, tenantId, STATES.SUMMARY_CONFIRM, 'summary_built');
   return { reply_text: `${summaryPayload.summary}\nStimmt das so? (ja/nein)`, state: STATES.SUMMARY_CONFIRM };
 }
 
-async function handleSummaryConfirm({ text, session, intake }) {
+async function handleSummaryConfirm({ text, session, intake, tenantId }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.DONE, 'summary_confirmed');
-    await finalizeSession(session.id, 'completed');
+    await updateSessionState(session.id, tenantId, STATES.DONE, 'summary_confirmed');
+    await finalizeSession(session.id, tenantId, 'completed');
     return {
       reply_text: 'Vielen Dank. Ihre Angaben wurden erfasst. Wir melden uns zeitnah.',
       state: STATES.DONE,
@@ -333,15 +345,15 @@ async function handleSummaryConfirm({ text, session, intake }) {
     };
   }
   const data = { ...(intake.data || {}), corrections: text.trim() };
-  await updateIntake(session.id, { data });
-  return await buildSummaryResponse({ session, intake: { ...intake, data } });
+  await updateIntake(session.id, { data }, tenantId);
+  return await buildSummaryResponse({ session, intake: { ...intake, data }, tenantId });
 }
 
-async function finalizeSession(sessionId, status) {
-  await updateSession(sessionId, { status });
+async function finalizeSession(sessionId, tenantId, status) {
+  await updateSession(sessionId, tenantId, { status });
 }
 
-async function updateIntake(sessionId, fields) {
+async function updateIntake(sessionId, fields, tenantId) {
   const pool = getPool();
   const keys = Object.keys(fields);
   if (!keys.length) return;
@@ -354,107 +366,143 @@ async function updateIntake(sessionId, fields) {
     if (Array.isArray(v)) return JSON.stringify(v);
     return v;
   });
-  values.push(sessionId);
-  await pool.query(`UPDATE intakes SET ${assignments.join(', ')} WHERE session_id=$${values.length}`, values);
+  values.push(sessionId, tenantId);
+  await pool.query(
+    `UPDATE intakes SET ${assignments.join(', ')} WHERE session_id=$${values.length - 1} AND tenant_id=$${values.length}`,
+    values
+  );
 }
 
-async function updateSessionState(sessionId, state, reason) {
+async function updateSessionState(sessionId, tenantId, state, reason) {
   const pool = getPool();
-  const { rows } = await pool.query('SELECT state FROM sessions WHERE id=$1', [sessionId]);
+  const { rows } = await pool.query('SELECT state FROM sessions WHERE id=$1 AND tenant_id=$2', [sessionId, tenantId]);
   const fromState = rows[0]?.state || null;
-  await updateSession(sessionId, { state });
-  await recordTransition(sessionId, fromState, state, reason || 'state_change');
+  if (fromState) {
+    const { rows: lastTransitions } = await pool.query(
+      'SELECT created_at FROM session_transitions WHERE session_id=$1 AND tenant_id=$2 ORDER BY created_at DESC LIMIT 1',
+      [sessionId, tenantId]
+    );
+    const lastTransitionAt = lastTransitions[0]?.created_at;
+    if (lastTransitionAt) {
+      const duration = Date.now() - new Date(lastTransitionAt).getTime();
+      metrics.increment(`state.duration_ms.${fromState.toLowerCase()}`, duration);
+    }
+  }
+  await updateSession(sessionId, tenantId, { state });
+  await recordTransition(sessionId, tenantId, fromState, state, reason || 'state_change');
+  metrics.increment(`state.transition.${fromState || 'none'}.${state}`);
 }
 
-async function updateSession(sessionId, fields) {
+async function updateSession(sessionId, tenantId, fields) {
   const pool = getPool();
   const keys = Object.keys(fields);
   if (!keys.length) return;
   const assignments = keys.map((key, idx) => `${key}=$${idx + 1}`);
   const values = keys.map((k) => fields[k]);
-  values.push(sessionId);
-  await pool.query(`UPDATE sessions SET ${assignments.join(', ')} WHERE id=$${values.length}`, values);
+  values.push(sessionId, tenantId);
+  await pool.query(
+    `UPDATE sessions SET ${assignments.join(', ')} WHERE id=$${values.length - 1} AND tenant_id=$${values.length}`,
+    values
+  );
 }
 
-async function getIntake(sessionId) {
+async function getIntake(sessionId, tenantId) {
   const pool = getPool();
-  const { rows } = await pool.query('SELECT * FROM intakes WHERE session_id=$1', [sessionId]);
+  const { rows } = await pool.query(
+    'SELECT * FROM intakes WHERE session_id=$1 AND tenant_id=$2 AND deleted_at IS NULL',
+    [sessionId, tenantId]
+  );
   return normalizeRecord(rows[0]);
 }
 
-async function updateLeadScore(sessionId, intake) {
+async function updateLeadScore(sessionId, tenantId, intake) {
   const score = computeLeadScore(intake);
-  await updateIntake(sessionId, {
-    lead_score: score.score,
-    lead_tier: score.tier,
-    lead_routing: score.routing
-  });
+  await updateIntake(
+    sessionId,
+    {
+      lead_score: score.score,
+      lead_tier: score.tier,
+      lead_routing: score.routing
+    },
+    tenantId
+  );
   const pool = getPool();
   await pool.query(
-    'INSERT INTO lead_scores (id, session_id, score, tier, routing, factors) VALUES ($1,$2,$3,$4,$5,$6)',
-    [uuidv4(), sessionId, score.score, score.tier, score.routing, JSON.stringify(score.factors)]
+    'INSERT INTO lead_scores (id, tenant_id, session_id, score, tier, routing, factors) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [uuidv4(), tenantId, sessionId, score.score, score.tier, score.routing, JSON.stringify(score.factors)]
   );
   return score;
 }
 
 export async function processDialog(input) {
-  const { session_id: sessionId, text, context = {} } = input;
+  const { session_id: sessionId, text, context = {}, tenant_id: tenantId } = input;
   if (!text) {
-    throw new UserError('Missing text', 400);
+    throw new UserError('Missing text', 400, {}, 'VALIDATION_MISSING_TEXT');
   }
-  const session = await ensureSession(sessionId);
-  const intake = await getIntake(session.id);
-  await appendMessage(session.id, 'user', text);
+  if (!tenantId) {
+    throw new SystemError('Missing tenant context', {}, 'TENANT_MISSING');
+  }
+  const session = await ensureSession(sessionId, tenantId);
+  const logContext = getContext();
+  if (logContext) {
+    logContext.session_id = session.id;
+    logContext.tenant_id = tenantId;
+  }
+  const intake = await getIntake(session.id, tenantId);
+  if (!intake) {
+    throw new SystemError('Intake not found', { session_id: session.id }, 'INTAKE_NOT_FOUND');
+  }
+  await appendMessage(session.id, tenantId, 'user', text);
 
   let response;
   switch (session.state) {
     case STATES.CONSENT:
-      response = await handleConsent({ text, session, intake, context });
+      response = await handleConsent({ text, session, intake, context, tenantId });
       break;
     case STATES.NAME:
-      response = await handleName({ text, session, intake });
+      response = await handleName({ text, session, intake, tenantId });
       break;
     case STATES.NAME_CONFIRM:
-      response = await handleNameConfirm({ text, session, intake });
+      response = await handleNameConfirm({ text, session, intake, tenantId });
       break;
     case STATES.PHONE:
-      response = await handlePhone({ text, session, intake });
+      response = await handlePhone({ text, session, intake, tenantId });
       break;
     case STATES.PHONE_CONFIRM:
-      response = await handlePhoneConfirm({ text, session, intake });
+      response = await handlePhoneConfirm({ text, session, intake, tenantId });
       break;
     case STATES.EMAIL:
-      response = await handleEmail({ text, session, intake });
+      response = await handleEmail({ text, session, intake, tenantId });
       break;
     case STATES.EMAIL_CONFIRM:
-      response = await handleEmailConfirm({ text, session, intake });
+      response = await handleEmailConfirm({ text, session, intake, tenantId });
       break;
     case STATES.JURISDICTION:
-      response = await handleJurisdiction({ text, session, intake });
+      response = await handleJurisdiction({ text, session, intake, tenantId });
       break;
     case STATES.DESCRIPTION:
-      response = await handleDescription({ text, session, intake });
+      response = await handleDescription({ text, session, intake, tenantId });
       break;
     case STATES.URGENCY:
-      response = await handleUrgency({ text, session, intake });
+      response = await handleUrgency({ text, session, intake, tenantId });
       break;
     case STATES.CASE_DETAILS:
-      response = await handleCaseDetails({ text, session, intake });
+      response = await handleCaseDetails({ text, session, intake, tenantId });
       break;
     case STATES.SUMMARY:
-      response = await buildSummaryResponse({ session, intake });
+      response = await buildSummaryResponse({ session, intake, tenantId });
       break;
     case STATES.SUMMARY_CONFIRM:
-      response = await handleSummaryConfirm({ text, session, intake });
+      response = await handleSummaryConfirm({ text, session, intake, tenantId });
       break;
     default:
       response = { reply_text: 'Danke. Wir haben bereits alles Nötige.', state: STATES.DONE, done: true };
   }
 
-  const updatedIntake = await getIntake(session.id);
+  const updatedIntake = await getIntake(session.id, tenantId);
   const missing_fields = updateMissingFields(updatedIntake, response.state, updatedIntake.case_type);
-  await updateIntake(session.id, { missing_fields });
-  const score = await updateLeadScore(session.id, updatedIntake);
+  await updateIntake(session.id, { missing_fields }, tenantId);
+  const score = await updateLeadScore(session.id, tenantId, updatedIntake);
 
   const output = {
     session_id: session.id,
@@ -477,35 +525,52 @@ export async function processDialog(input) {
     done: Boolean(response.done)
   };
 
-  await appendMessage(session.id, 'assistant', response.reply_text);
+  await appendMessage(session.id, tenantId, 'assistant', response.reply_text);
   logger.info('dialog_processed', {
     session_id: session.id,
     state: response.state,
     done: Boolean(response.done)
   });
+  metrics.increment(`dialog.state.${response.state.toLowerCase()}`);
+  if (response.done) {
+    metrics.increment('dialog.completed');
+  }
   return output;
 }
 
-export async function getSessionSnapshot(id) {
+export async function getSessionSnapshot(id, tenantId) {
   const pool = getPool();
-  const { rows: sessions } = await pool.query('SELECT * FROM sessions WHERE id=$1', [id]);
-  if (!sessions.length) return null;
-  const { rows: intakes } = await pool.query('SELECT * FROM intakes WHERE session_id=$1', [id]);
-  const { rows: messages } = await pool.query('SELECT * FROM messages WHERE session_id=$1 ORDER BY created_at', [id]);
-  const { rows: transitions } = await pool.query(
-    'SELECT * FROM session_transitions WHERE session_id=$1 ORDER BY created_at',
-    [id]
+  const { rows: sessions } = await pool.query(
+    'SELECT * FROM sessions WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL',
+    [id, tenantId]
   );
-  const { rows: consents } = await pool.query('SELECT * FROM consents WHERE session_id=$1 ORDER BY created_at', [id]);
-  const { rows: leadScores } = await pool.query('SELECT * FROM lead_scores WHERE session_id=$1 ORDER BY created_at', [
-    id
-  ]);
+  if (!sessions.length) return null;
+  const { rows: intakes } = await pool.query(
+    'SELECT * FROM intakes WHERE session_id=$1 AND tenant_id=$2 AND deleted_at IS NULL',
+    [id, tenantId]
+  );
+  const { rows: messages } = await pool.query(
+    'SELECT * FROM messages WHERE session_id=$1 AND tenant_id=$2 AND deleted_at IS NULL ORDER BY created_at',
+    [id, tenantId]
+  );
+  const { rows: transitions } = await pool.query(
+    'SELECT * FROM session_transitions WHERE session_id=$1 AND tenant_id=$2 AND deleted_at IS NULL ORDER BY created_at',
+    [id, tenantId]
+  );
+  const { rows: consents } = await pool.query(
+    'SELECT * FROM consents WHERE session_id=$1 AND tenant_id=$2 AND deleted_at IS NULL ORDER BY created_at',
+    [id, tenantId]
+  );
+  const { rows: leadScores } = await pool.query(
+    'SELECT * FROM lead_scores WHERE session_id=$1 AND tenant_id=$2 AND deleted_at IS NULL ORDER BY created_at',
+    [id, tenantId]
+  );
   return { session: sessions[0], intake: normalizeRecord(intakes[0]), messages, transitions, consents, lead_scores: leadScores };
 }
 
-export async function submitIntake(id) {
-  await updateIntake(id, { submitted_to_make: true, submitted_at: new Date().toISOString() });
-  return getSessionSnapshot(id);
+export async function submitIntake(id, tenantId) {
+  await updateIntake(id, { submitted_to_make: true, submitted_at: new Date().toISOString() }, tenantId);
+  return getSessionSnapshot(id, tenantId);
 }
 
 export { STATES };
