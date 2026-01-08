@@ -1,17 +1,16 @@
 import dotenv from 'dotenv';
 import app from './src/app.js';
-import { runMigrations } from './src/db/index.js';
-import { logger } from './src/services/logger.js';
+import { runMigrations } from './src/services/db.js';
 
 dotenv.config();
 
 const PORT = process.env.PORT || 3000;
 
-async function bootstrap() {
+async function start() {
   await runMigrations();
   app.listen(PORT, () => {
-    logger.info('server_started', { port: PORT });
+    process.stdout.write(`Server listening on ${PORT}\n`);
   });
 }
 
-bootstrap();
+start();

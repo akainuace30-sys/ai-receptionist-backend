@@ -1,18 +1,17 @@
 import express from 'express';
-import { getSessionSnapshot } from '../services/dialogService.js';
-import { rateLimit } from '../middleware/rateLimit.js';
-import { requireRole } from '../middleware/auth.js';
+import { getPool } from '../services/db.js';
 
 const router = express.Router();
 
-router.use(rateLimit({ windowMs: 60_000, max: 30, keyPrefix: 'session' }));
-router.use(requireRole(['system', 'tenant_admin', 'operator']));
-
 router.get('/:id', async (req, res, next) => {
   try {
-    const session = await getSessionSnapshot(req.params.id, req.tenant?.id);
-    if (!session) return res.status(404).json({ error: 'Not found' });
-    res.json(session);
+    const pool = getPool();
+    const { rows } = await pool.query('SELECT * FROM sessions WHERE id=$1 AND tenant_id=$2', [
+      req.params.id,
+      req.tenant.id
+    ]);
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' });
+    res.json(rows[0]);
   } catch (err) {
     next(err);
   }
