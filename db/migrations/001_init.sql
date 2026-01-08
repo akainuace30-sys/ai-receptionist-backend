@@ -92,6 +92,13 @@ CREATE TABLE IF NOT EXISTS lead_scores (
   deleted_at TIMESTAMPTZ
 );
 
+CREATE INDEX IF NOT EXISTS sessions_tenant_id_idx ON sessions (tenant_id);
+CREATE INDEX IF NOT EXISTS messages_tenant_session_idx ON messages (tenant_id, session_id);
+CREATE INDEX IF NOT EXISTS intakes_tenant_id_idx ON intakes (tenant_id);
+CREATE INDEX IF NOT EXISTS consents_tenant_session_idx ON consents (tenant_id, session_id);
+CREATE INDEX IF NOT EXISTS session_transitions_tenant_session_idx ON session_transitions (tenant_id, session_id);
+CREATE INDEX IF NOT EXISTS lead_scores_tenant_session_idx ON lead_scores (tenant_id, session_id);
+
 CREATE OR REPLACE FUNCTION touch_session_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
