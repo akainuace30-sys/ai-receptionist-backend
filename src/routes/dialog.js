@@ -1,18 +1,17 @@
 import express from 'express';
 import { processDialog } from '../services/dialogService.js';
+import { logger } from '../services/logger.js';
 
 const router = express.Router();
 
-router.post('/', async (req, res) => {
+router.post('/', async (req, res, next) => {
   try {
-    const result = await processDialog(req.body || {});
+    const context = { ipAddress: req.ip, userAgent: req.get('user-agent'), channel: 'api' };
+    const result = await processDialog({ ...(req.body || {}), context });
     res.json(result);
   } catch (err) {
-    if (err.status) {
-      return res.status(err.status).json(err.body);
-    }
-    console.error('Dialog error', err);
-    res.status(500).json({ error: 'Internal error' });
+    logger.error('dialog_error', { session_id: req.body?.session_id, error: err.name });
+    next(err);
   }
 });
 

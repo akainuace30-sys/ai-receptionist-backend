@@ -18,17 +18,55 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS intakes (
   session_id UUID PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
   consent_given BOOLEAN DEFAULT FALSE,
+  consent_at TIMESTAMPTZ,
   name TEXT,
   phone TEXT,
   email TEXT,
+  jurisdiction TEXT,
   case_type TEXT,
   summary TEXT,
   urgency TEXT,
   missing_fields JSON,
   confidence JSON,
   data JSONB,
+  lead_score NUMERIC,
+  lead_tier TEXT,
+  lead_routing TEXT,
   submitted_to_make BOOLEAN DEFAULT FALSE,
-  submitted_at TIMESTAMPTZ
+  submitted_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS consents (
+  id UUID PRIMARY KEY,
+  session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
+  channel TEXT NOT NULL,
+  consent_text TEXT NOT NULL,
+  consented BOOLEAN NOT NULL DEFAULT FALSE,
+  consented_at TIMESTAMPTZ,
+  ip_address TEXT,
+  user_agent TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS session_transitions (
+  id UUID PRIMARY KEY,
+  session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS lead_scores (
+  id UUID PRIMARY KEY,
+  session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
+  score NUMERIC NOT NULL,
+  tier TEXT NOT NULL,
+  routing TEXT NOT NULL,
+  factors JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE OR REPLACE FUNCTION touch_session_updated_at()
@@ -44,3 +82,17 @@ CREATE TRIGGER sessions_touch_updated_at
 BEFORE UPDATE ON sessions
 FOR EACH ROW
 EXECUTE PROCEDURE touch_session_updated_at();
+
+CREATE OR REPLACE FUNCTION touch_intake_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS intakes_touch_updated_at ON intakes;
+CREATE TRIGGER intakes_touch_updated_at
+BEFORE UPDATE ON intakes
+FOR EACH ROW
+EXECUTE PROCEDURE touch_intake_updated_at();

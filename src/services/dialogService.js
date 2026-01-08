@@ -1,7 +1,18 @@
 import { v4 as uuidv4 } from 'uuid';
 import { getPool } from '../db/index.js';
-import { classifyCaseType, buildFinalSummary } from './llmService.js';
-import { isAffirmative, isNegative, normalizeName, extractPhone } from '../utils/validation.js';
+import { classifyCaseType, buildFinalSummary, craftNextQuestion } from './llmService.js';
+import {
+  isAffirmative,
+  isNegative,
+  normalizeName,
+  extractPhone,
+  extractEmail,
+  extractJurisdiction,
+  normalizeUrgency
+} from '../utils/validation.js';
+import { UserError } from '../utils/errors.js';
+import { logger } from './logger.js';
+import { computeLeadScore } from './leadScoring.js';
 
 const STATES = {
   CONSENT: 'CONSENT',
@@ -9,7 +20,11 @@ const STATES = {
   NAME_CONFIRM: 'NAME_CONFIRM',
   PHONE: 'PHONE',
   PHONE_CONFIRM: 'PHONE_CONFIRM',
+  EMAIL: 'EMAIL',
+  EMAIL_CONFIRM: 'EMAIL_CONFIRM',
+  JURISDICTION: 'JURISDICTION',
   DESCRIPTION: 'DESCRIPTION',
+  URGENCY: 'URGENCY',
   CASE_DETAILS: 'CASE_DETAILS',
   SUMMARY: 'SUMMARY',
   SUMMARY_CONFIRM: 'SUMMARY_CONFIRM',
@@ -17,10 +32,29 @@ const STATES = {
 };
 
 const CASE_FIELDS = {
-  traffic: ['datum', 'ort', 'verletzungen', 'gegner_bekannt', 'polizei'],
-  employment: ['datum', 'frist', 'arbeitgeber', 'status', 'dokumente'],
-  family: ['thema', 'datum', 'kinder', 'dringlichkeit']
+  traffic: ['datum', 'ort', 'verletzungen', 'gegner_bekannt', 'polizei', 'schadenhoehe'],
+  employment: ['datum', 'frist', 'arbeitgeber', 'status', 'dokumente', 'streitwert'],
+  family: ['thema', 'datum', 'kinder', 'dringlichkeit_detail']
 };
+
+const CASE_QUESTIONS = {
+  datum: 'Wann ist das passiert? Bitte nennen Sie ein Datum.',
+  ort: 'Wo ist es passiert? (Ort/Adresse)',
+  verletzungen: 'Gab es Verletzungen? (ja/nein)',
+  gegner_bekannt: 'Ist der Unfallgegner bekannt? (ja/nein)',
+  polizei: 'War die Polizei vor Ort? (ja/nein)',
+  schadenhoehe: 'Wie hoch ist die ungefähre Schadenhöhe?',
+  frist: 'Haben Sie eine Frist genannt bekommen? Falls ja, welche?',
+  arbeitgeber: 'Wie heißt der Arbeitgeber?',
+  status: 'Ist es eine Kündigung oder Abmahnung? Was ist der aktuelle Status?',
+  dokumente: 'Liegen Schriftstücke vor? (ja/nein)',
+  streitwert: 'Gibt es einen Streitwert oder eine Einschätzung zur Höhe?',
+  thema: 'Worum geht es genau? (Sorgerecht, Trennung, Unterhalt, anderes)',
+  kinder: 'Sind Kinder betroffen? Wenn ja, wie viele?',
+  dringlichkeit_detail: 'Gibt es besondere Fristen oder Eilbedarf im Familienrecht?'
+};
+
+const MAX_RETRIES = 2;
 
 async function ensureSession(sessionId) {
   const pool = getPool();
@@ -28,12 +62,11 @@ async function ensureSession(sessionId) {
   const { rows } = await pool.query('SELECT * FROM sessions WHERE id=$1', [id]);
   if (rows.length) return rows[0];
   await pool.query('INSERT INTO sessions (id, state, status) VALUES ($1,$2,$3)', [id, STATES.CONSENT, 'active']);
-  await pool.query('INSERT INTO intakes (session_id, data, missing_fields, confidence) VALUES ($1,$2,$3,$4)', [
-    id,
-    {},
-    JSON.stringify([]),
-    JSON.stringify({})
-  ]);
+  await pool.query(
+    'INSERT INTO intakes (session_id, data, missing_fields, confidence) VALUES ($1,$2,$3,$4)',
+    [id, JSON.stringify({ _meta: { retries: {} } }), JSON.stringify([]), JSON.stringify({})]
+  );
+  await recordTransition(id, null, STATES.CONSENT, 'session_created');
   return (await pool.query('SELECT * FROM sessions WHERE id=$1', [id])).rows[0];
 }
 
@@ -47,28 +80,67 @@ async function appendMessage(sessionId, role, text) {
   ]);
 }
 
+async function recordConsent({ sessionId, consented, channel, consentText, ipAddress, userAgent }) {
+  const pool = getPool();
+  await pool.query(
+    'INSERT INTO consents (id, session_id, channel, consent_text, consented, consented_at, ip_address, user_agent) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+    [
+      uuidv4(),
+      sessionId,
+      channel || 'api',
+      consentText,
+      consented,
+      new Date().toISOString(),
+      ipAddress || null,
+      userAgent || null
+    ]
+  );
+}
+
+async function recordTransition(sessionId, fromState, toState, reason) {
+  const pool = getPool();
+  await pool.query(
+    'INSERT INTO session_transitions (id, session_id, from_state, to_state, reason) VALUES ($1,$2,$3,$4,$5)',
+    [uuidv4(), sessionId, fromState, toState, reason]
+  );
+}
+
 function updateMissingFields(intake, state, caseType) {
   const missing = [];
-  if (!intake.consent_given && state !== STATES.CONSENT) missing.push('consent');
-  if (!intake.name && [STATES.PHONE, STATES.PHONE_CONFIRM, STATES.DESCRIPTION, STATES.CASE_DETAILS, STATES.SUMMARY].includes(state)) {
-    missing.push('name');
-  }
-  if (!intake.phone && [STATES.DESCRIPTION, STATES.CASE_DETAILS, STATES.SUMMARY].includes(state)) {
-    missing.push('phone');
-  }
-  if (!intake.data?.description && [STATES.CASE_DETAILS, STATES.SUMMARY].includes(state)) {
-    missing.push('anliegen');
-  }
+  if (!intake.consent_given) missing.push('consent');
+  if (!intake.name) missing.push('name');
+  if (!intake.phone) missing.push('phone');
+  if (!intake.email && !intake.data?.email_missing_reason) missing.push('email');
+  if (!intake.jurisdiction) missing.push('jurisdiction');
+  if (!intake.case_type) missing.push('case_type');
+  if (!intake.data?.description) missing.push('anliegen');
+  if (!intake.urgency) missing.push('urgency');
   if (caseType && CASE_FIELDS[caseType]) {
     for (const field of CASE_FIELDS[caseType]) {
       if (!intake.data?.[field]) missing.push(field);
     }
   }
+  if (state === STATES.DONE) return [];
   return missing;
 }
 
-async function handleConsent({ text, session, intake }) {
+function getRetryCount(intake, key) {
+  return intake?.data?._meta?.retries?.[key] || 0;
+}
+
+async function incrementRetry(sessionId, intake, key) {
+  const meta = intake.data?._meta || { retries: {} };
+  const retries = { ...(meta.retries || {}) };
+  retries[key] = (retries[key] || 0) + 1;
+  await updateIntake(sessionId, { data: { ...(intake.data || {}), _meta: { ...meta, retries } } });
+  return retries[key];
+}
+
+async function handleConsent({ text, session, intake, context }) {
+  const consentText = 'Ich stimme der Verarbeitung meiner Angaben gemäß DSGVO zu.';
   if (isNegative(text)) {
+    await recordConsent({ sessionId: session.id, consented: false, consentText, ...context });
+    await updateSessionState(session.id, STATES.DONE, 'consent_declined');
     await finalizeSession(session.id, 'abgelehnt');
     return {
       reply_text: 'Alles klar, wir beenden hier. Danke für Ihre Zeit.',
@@ -77,80 +149,151 @@ async function handleConsent({ text, session, intake }) {
     };
   }
   if (isAffirmative(text)) {
-    await updateIntake(session.id, { consent_given: true });
-    await updateSessionState(session.id, STATES.NAME);
+    await updateIntake(session.id, { consent_given: true, consent_at: new Date().toISOString() });
+    await recordConsent({ sessionId: session.id, consented: true, consentText, ...context });
+    await updateSessionState(session.id, STATES.NAME, 'consent_accepted');
     return { reply_text: 'Vielen Dank. Wie ist Ihr vollständiger Name?', state: STATES.NAME };
   }
-  return { reply_text: 'Bitte bestätigen Sie: Einverstanden mit Aufzeichnung und Datenschutz? (ja/nein)', state: STATES.CONSENT };
+  return {
+    reply_text: 'Bitte bestätigen Sie: Einverstanden mit Aufzeichnung und Datenschutz? (ja/nein)',
+    state: STATES.CONSENT
+  };
 }
 
 async function handleName({ text, session, intake }) {
   const name = normalizeName(text);
+  if (!name || name.length < 3) {
+    const retries = await incrementRetry(session.id, intake, 'name');
+    if (retries >= MAX_RETRIES) {
+      return { reply_text: 'Bitte nennen Sie Ihren vollständigen Namen, inklusive Nachname.', state: STATES.NAME };
+    }
+    return { reply_text: 'Ich habe den Namen nicht verstanden. Bitte wiederholen Sie ihn.', state: STATES.NAME };
+  }
   await updateIntake(session.id, { name });
-  await updateSessionState(session.id, STATES.NAME_CONFIRM);
+  await updateSessionState(session.id, STATES.NAME_CONFIRM, 'name_captured');
   return { reply_text: `Habe ich richtig verstanden, Ihr Name ist ${name}? (ja/nein)`, state: STATES.NAME_CONFIRM };
 }
 
-async function handleNameConfirm({ text, session, intake }) {
+async function handleNameConfirm({ text, session }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.PHONE);
+    await updateSessionState(session.id, STATES.PHONE, 'name_confirmed');
     return { reply_text: 'Bitte nennen Sie Ihre Telefonnummer (z. B. +49171...).', state: STATES.PHONE };
   }
   await updateIntake(session.id, { name: null });
-  await updateSessionState(session.id, STATES.NAME);
+  await updateSessionState(session.id, STATES.NAME, 'name_rejected');
   return { reply_text: 'Bitte nennen Sie Ihren vollständigen Namen.', state: STATES.NAME };
 }
 
-async function handlePhone({ text, session }) {
+async function handlePhone({ text, session, intake }) {
   const phone = extractPhone(text);
   if (!phone) {
-    return { reply_text: 'Die Nummer wirkt nicht gültig. Bitte im Format +49 oder 0 beginnend angeben.', state: STATES.PHONE };
+    const retries = await incrementRetry(session.id, intake, 'phone');
+    if (retries >= MAX_RETRIES) {
+      return { reply_text: 'Bitte im Format +49 oder 0 beginnend angeben, z. B. +491701234567.', state: STATES.PHONE };
+    }
+    return { reply_text: 'Die Nummer wirkt nicht gültig. Bitte erneut angeben.', state: STATES.PHONE };
   }
   await updateIntake(session.id, { phone });
-  await updateSessionState(session.id, STATES.PHONE_CONFIRM);
+  await updateSessionState(session.id, STATES.PHONE_CONFIRM, 'phone_captured');
   return { reply_text: `Ist ${phone} korrekt? (ja/nein)`, state: STATES.PHONE_CONFIRM };
 }
 
 async function handlePhoneConfirm({ text, session }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.DESCRIPTION);
-    return { reply_text: 'Vielen Dank. Bitte schildern Sie kurz Ihr Anliegen.', state: STATES.DESCRIPTION };
+    await updateSessionState(session.id, STATES.EMAIL, 'phone_confirmed');
+    return { reply_text: 'Bitte nennen Sie Ihre E-Mail-Adresse. Falls keine vorhanden, schreiben Sie "keine".', state: STATES.EMAIL };
   }
   await updateIntake(session.id, { phone: null });
-  await updateSessionState(session.id, STATES.PHONE);
+  await updateSessionState(session.id, STATES.PHONE, 'phone_rejected');
   return { reply_text: 'Bitte wiederholen Sie Ihre Telefonnummer.', state: STATES.PHONE };
 }
 
-async function handleDescription({ text, session, intake }) {
-  const data = { ...(intake.data || {}), description: text.trim() };
-  const classification = await classifyCaseType(text);
-  await updateIntake(session.id, { data, case_type: classification.case_type, confidence: classification });
-  await updateSession(session.id, { state: STATES.CASE_DETAILS, case_type: classification.case_type });
-  const next = nextCaseQuestion(classification.case_type, data);
-  return { reply_text: next, state: STATES.CASE_DETAILS, case_type: classification.case_type };
+function isNoEmail(text) {
+  return /keine|kein|nicht vorhanden|habe keine/i.test(text || '');
 }
 
-function nextCaseQuestion(caseType, data = {}) {
+async function handleEmail({ text, session, intake }) {
+  if (isNoEmail(text)) {
+    const data = { ...(intake.data || {}), email_missing_reason: 'keine' };
+    await updateIntake(session.id, { email: null, data });
+    await updateSessionState(session.id, STATES.JURISDICTION, 'email_skipped');
+    return { reply_text: 'Verstanden. In welchem Bundesland (Jurisdiktion) ist der Fall?', state: STATES.JURISDICTION };
+  }
+  const email = extractEmail(text);
+  if (!email) {
+    const retries = await incrementRetry(session.id, intake, 'email');
+    if (retries >= MAX_RETRIES) {
+      return { reply_text: 'Bitte geben Sie eine gültige E-Mail an, z. B. name@example.de.', state: STATES.EMAIL };
+    }
+    return { reply_text: 'Die E-Mail-Adresse wirkt nicht gültig. Bitte erneut angeben.', state: STATES.EMAIL };
+  }
+  await updateIntake(session.id, { email });
+  await updateSessionState(session.id, STATES.EMAIL_CONFIRM, 'email_captured');
+  return { reply_text: `Ist ${email} korrekt? (ja/nein)`, state: STATES.EMAIL_CONFIRM };
+}
+
+async function handleEmailConfirm({ text, session }) {
+  if (isAffirmative(text)) {
+    await updateSessionState(session.id, STATES.JURISDICTION, 'email_confirmed');
+    return { reply_text: 'In welchem Bundesland (Jurisdiktion) ist der Fall?', state: STATES.JURISDICTION };
+  }
+  await updateIntake(session.id, { email: null });
+  await updateSessionState(session.id, STATES.EMAIL, 'email_rejected');
+  return { reply_text: 'Bitte nennen Sie Ihre E-Mail-Adresse.', state: STATES.EMAIL };
+}
+
+async function handleJurisdiction({ text, session, intake }) {
+  const jurisdiction = extractJurisdiction(text);
+  if (!jurisdiction) {
+    const retries = await incrementRetry(session.id, intake, 'jurisdiction');
+    if (retries >= MAX_RETRIES) {
+      return { reply_text: 'Bitte nennen Sie das Bundesland, z. B. Nordrhein-Westfalen.', state: STATES.JURISDICTION };
+    }
+    return { reply_text: 'Ich habe das Bundesland nicht erkannt. Bitte erneut angeben.', state: STATES.JURISDICTION };
+  }
+  await updateIntake(session.id, { jurisdiction });
+  await updateSessionState(session.id, STATES.DESCRIPTION, 'jurisdiction_captured');
+  return { reply_text: 'Bitte schildern Sie kurz Ihr Anliegen.', state: STATES.DESCRIPTION };
+}
+
+async function handleDescription({ text, session, intake }) {
+  const description = text.trim();
+  if (!description) {
+    return { reply_text: 'Bitte schildern Sie Ihr Anliegen mit wenigen Sätzen.', state: STATES.DESCRIPTION };
+  }
+  const data = { ...(intake.data || {}), description };
+  const classification = await classifyCaseType(description);
+  await updateIntake(session.id, { data, case_type: classification.case_type, confidence: classification });
+  await updateSession(session.id, { state: STATES.URGENCY, case_type: classification.case_type });
+  await recordTransition(session.id, STATES.DESCRIPTION, STATES.URGENCY, 'description_captured');
+  return { reply_text: 'Wie dringend ist die Angelegenheit? (niedrig/mittel/hoch)', state: STATES.URGENCY };
+}
+
+async function handleUrgency({ text, session, intake }) {
+  const urgency = normalizeUrgency(text);
+  if (!urgency) {
+    const retries = await incrementRetry(session.id, intake, 'urgency');
+    if (retries >= MAX_RETRIES) {
+      return { reply_text: 'Bitte wählen Sie: niedrig, mittel oder hoch.', state: STATES.URGENCY };
+    }
+    return { reply_text: 'Ich habe die Dringlichkeit nicht verstanden. Bitte erneut angeben.', state: STATES.URGENCY };
+  }
+  await updateIntake(session.id, { urgency });
+  await updateSessionState(session.id, STATES.CASE_DETAILS, 'urgency_captured');
+  const nextQuestion = await nextCaseQuestion(intake.case_type, intake.data || {});
+  return { reply_text: nextQuestion, state: STATES.CASE_DETAILS };
+}
+
+async function nextCaseQuestion(caseType, data = {}) {
   const fields = CASE_FIELDS[caseType] || [];
   const missing = fields.filter((field) => !data[field]);
-  if (!missing.length) return 'Gibt es noch etwas Wichtiges, das ich wissen sollte?';
+  if (!missing.length) {
+    const llmQuestion = await craftNextQuestion({ missingFields: [], state: STATES.SUMMARY });
+    return llmQuestion.question;
+  }
   const field = missing[0];
-  const questions = {
-    datum: 'Wann ist das passiert? Bitte nennen Sie ein Datum.',
-    ort: 'Wo ist es passiert? (Ort/Adresse)',
-    verletzungen: 'Gab es Verletzungen? (ja/nein)',
-    gegner_bekannt: 'Ist der Unfallgegner bekannt? (ja/nein)',
-    polizei: 'War die Polizei vor Ort? (ja/nein)',
-    frist: 'Haben Sie eine Frist genannt bekommen? Falls ja, welche?',
-    arbeitgeber: 'Wie heißt der Arbeitgeber?',
-    status: 'Ist es eine Kündigung oder Abmahnung? Was ist der aktuelle Status?',
-    dokumente: 'Liegen Schriftstücke vor? (ja/nein)',
-    thema: 'Worum geht es genau? (Sorgerecht, Trennung, Unterhalt, anderes)',
-    kinder: 'Sind Kinder betroffen? Wenn ja, wie viele?',
-    dringlichkeit: 'Wie dringend ist die Angelegenheit?',
-    gegner: 'Wer ist die Gegenseite?'
-  };
-  return questions[field] || `Bitte teilen Sie ${field} mit.`;
+  const question = CASE_QUESTIONS[field] || `Bitte teilen Sie ${field} mit.`;
+  return question;
 }
 
 async function handleCaseDetails({ text, session, intake }) {
@@ -166,22 +309,22 @@ async function handleCaseDetails({ text, session, intake }) {
   await updateIntake(session.id, { data });
   const missing = caseFields.filter((f) => !data[f]);
   if (missing.length === 0) {
-    await updateSessionState(session.id, STATES.SUMMARY);
+    await updateSessionState(session.id, STATES.SUMMARY, 'case_details_complete');
     return await buildSummaryResponse({ session, intake: { ...intake, data } });
   }
-  return { reply_text: nextCaseQuestion(caseType, data), state: STATES.CASE_DETAILS };
+  return { reply_text: await nextCaseQuestion(caseType, data), state: STATES.CASE_DETAILS };
 }
 
 async function buildSummaryResponse({ session, intake }) {
-  const summary = await buildFinalSummary({ ...intake, data: intake.data });
-  await updateIntake(session.id, { summary });
-  await updateSessionState(session.id, STATES.SUMMARY_CONFIRM);
-  return { reply_text: `${summary}\nStimmt das so? (ja/nein)`, state: STATES.SUMMARY_CONFIRM };
+  const summaryPayload = await buildFinalSummary({ ...intake, data: intake.data });
+  await updateIntake(session.id, { summary: summaryPayload.summary });
+  await updateSessionState(session.id, STATES.SUMMARY_CONFIRM, 'summary_built');
+  return { reply_text: `${summaryPayload.summary}\nStimmt das so? (ja/nein)`, state: STATES.SUMMARY_CONFIRM };
 }
 
 async function handleSummaryConfirm({ text, session, intake }) {
   if (isAffirmative(text)) {
-    await updateSessionState(session.id, STATES.DONE);
+    await updateSessionState(session.id, STATES.DONE, 'summary_confirmed');
     await finalizeSession(session.id, 'completed');
     return {
       reply_text: 'Vielen Dank. Ihre Angaben wurden erfasst. Wir melden uns zeitnah.',
@@ -195,7 +338,7 @@ async function handleSummaryConfirm({ text, session, intake }) {
 }
 
 async function finalizeSession(sessionId, status) {
-  await updateSession(sessionId, { status, state: STATES.DONE });
+  await updateSession(sessionId, { status });
 }
 
 async function updateIntake(sessionId, fields) {
@@ -215,8 +358,12 @@ async function updateIntake(sessionId, fields) {
   await pool.query(`UPDATE intakes SET ${assignments.join(', ')} WHERE session_id=$${values.length}`, values);
 }
 
-async function updateSessionState(sessionId, state) {
+async function updateSessionState(sessionId, state, reason) {
+  const pool = getPool();
+  const { rows } = await pool.query('SELECT state FROM sessions WHERE id=$1', [sessionId]);
+  const fromState = rows[0]?.state || null;
   await updateSession(sessionId, { state });
+  await recordTransition(sessionId, fromState, state, reason || 'state_change');
 }
 
 async function updateSession(sessionId, fields) {
@@ -235,11 +382,25 @@ async function getIntake(sessionId) {
   return normalizeRecord(rows[0]);
 }
 
+async function updateLeadScore(sessionId, intake) {
+  const score = computeLeadScore(intake);
+  await updateIntake(sessionId, {
+    lead_score: score.score,
+    lead_tier: score.tier,
+    lead_routing: score.routing
+  });
+  const pool = getPool();
+  await pool.query(
+    'INSERT INTO lead_scores (id, session_id, score, tier, routing, factors) VALUES ($1,$2,$3,$4,$5,$6)',
+    [uuidv4(), sessionId, score.score, score.tier, score.routing, JSON.stringify(score.factors)]
+  );
+  return score;
+}
+
 export async function processDialog(input) {
-  const { session_id: sessionId, text } = input;
+  const { session_id: sessionId, text, context = {} } = input;
   if (!text) {
-    const error = { status: 400, body: { error: 'Missing text' } };
-    throw error;
+    throw new UserError('Missing text', 400);
   }
   const session = await ensureSession(sessionId);
   const intake = await getIntake(session.id);
@@ -248,7 +409,7 @@ export async function processDialog(input) {
   let response;
   switch (session.state) {
     case STATES.CONSENT:
-      response = await handleConsent({ text, session, intake });
+      response = await handleConsent({ text, session, intake, context });
       break;
     case STATES.NAME:
       response = await handleName({ text, session, intake });
@@ -262,8 +423,20 @@ export async function processDialog(input) {
     case STATES.PHONE_CONFIRM:
       response = await handlePhoneConfirm({ text, session, intake });
       break;
+    case STATES.EMAIL:
+      response = await handleEmail({ text, session, intake });
+      break;
+    case STATES.EMAIL_CONFIRM:
+      response = await handleEmailConfirm({ text, session, intake });
+      break;
+    case STATES.JURISDICTION:
+      response = await handleJurisdiction({ text, session, intake });
+      break;
     case STATES.DESCRIPTION:
       response = await handleDescription({ text, session, intake });
+      break;
+    case STATES.URGENCY:
+      response = await handleUrgency({ text, session, intake });
       break;
     case STATES.CASE_DETAILS:
       response = await handleCaseDetails({ text, session, intake });
@@ -281,6 +454,7 @@ export async function processDialog(input) {
   const updatedIntake = await getIntake(session.id);
   const missing_fields = updateMissingFields(updatedIntake, response.state, updatedIntake.case_type);
   await updateIntake(session.id, { missing_fields });
+  const score = await updateLeadScore(session.id, updatedIntake);
 
   const output = {
     session_id: session.id,
@@ -290,14 +464,25 @@ export async function processDialog(input) {
     extracted_fields: {
       name: updatedIntake.name,
       phone: updatedIntake.phone,
+      email: updatedIntake.email,
+      jurisdiction: updatedIntake.jurisdiction,
       description: updatedIntake.data?.description,
-      data: updatedIntake.data
+      urgency: updatedIntake.urgency,
+      data: sanitizeDataForOutput(updatedIntake.data)
     },
     missing_fields,
+    lead_score: score.score,
+    lead_tier: score.tier,
+    lead_routing: score.routing,
     done: Boolean(response.done)
   };
 
   await appendMessage(session.id, 'assistant', response.reply_text);
+  logger.info('dialog_processed', {
+    session_id: session.id,
+    state: response.state,
+    done: Boolean(response.done)
+  });
   return output;
 }
 
@@ -307,7 +492,15 @@ export async function getSessionSnapshot(id) {
   if (!sessions.length) return null;
   const { rows: intakes } = await pool.query('SELECT * FROM intakes WHERE session_id=$1', [id]);
   const { rows: messages } = await pool.query('SELECT * FROM messages WHERE session_id=$1 ORDER BY created_at', [id]);
-  return { session: sessions[0], intake: normalizeRecord(intakes[0]), messages };
+  const { rows: transitions } = await pool.query(
+    'SELECT * FROM session_transitions WHERE session_id=$1 ORDER BY created_at',
+    [id]
+  );
+  const { rows: consents } = await pool.query('SELECT * FROM consents WHERE session_id=$1 ORDER BY created_at', [id]);
+  const { rows: leadScores } = await pool.query('SELECT * FROM lead_scores WHERE session_id=$1 ORDER BY created_at', [
+    id
+  ]);
+  return { session: sessions[0], intake: normalizeRecord(intakes[0]), messages, transitions, consents, lead_scores: leadScores };
 }
 
 export async function submitIntake(id) {
@@ -330,4 +523,11 @@ function normalizeRecord(record) {
     }
   }
   return record;
+}
+
+function sanitizeDataForOutput(data) {
+  if (!data) return data;
+  const cloned = { ...data };
+  delete cloned._meta;
+  return cloned;
 }

@@ -1,6 +1,7 @@
 import express from 'express';
 import { processDialog } from '../services/dialogService.js';
 import { create } from 'xmlbuilder2';
+import { logger } from '../services/logger.js';
 
 const router = express.Router();
 
@@ -25,13 +26,15 @@ router.post('/inbound', (req, res) => {
 
 router.post('/gather', async (req, res) => {
   const speech = req.body.SpeechResult || req.body.Digits || '';
-  const sessionId = req.body.session_id;
+  const sessionId = req.body.session_id || req.body.CallSid;
   try {
-    const result = await processDialog({ session_id: sessionId, text: speech });
+    const context = { ipAddress: req.ip, userAgent: req.get('user-agent'), channel: 'voice' };
+    const result = await processDialog({ session_id: sessionId, text: speech, context });
     const doneMessage = result.done ? 'Vielen Dank. Wir melden uns zeitnah.' : result.reply_text;
     const twiml = buildGatherResponse(doneMessage, '/voice/gather');
     res.type('text/xml').send(twiml);
   } catch (err) {
+    logger.error('voice_error', { session_id: sessionId, error: err.name });
     const twiml = create({ version: '1.0', encoding: 'UTF-8' })
       .ele('Response')
       .ele('Say')

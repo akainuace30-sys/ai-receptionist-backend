@@ -9,7 +9,7 @@ describe('Dialog API', () => {
 
   beforeEach(async () => {
     const pool = getPool();
-    await pool.query('TRUNCATE messages, intakes, sessions RESTART IDENTITY CASCADE');
+    await pool.query('TRUNCATE messages, intakes, sessions, consents, session_transitions, lead_scores RESTART IDENTITY CASCADE');
   });
 
   test('returns 400 when text missing', async () => {
@@ -36,6 +36,12 @@ describe('Dialog API', () => {
     expect(phone.body.reply_text).toMatch(/nicht gültig/);
   });
 
+  test('consent rejection ends session', async () => {
+    const res = await request(app).post('/dialog').send({ text: 'nein' });
+    expect(res.body.done).toBe(true);
+    expect(res.body.state).toBe('DONE');
+  });
+
   test('happy path traffic', async () => {
     let res = await request(app).post('/dialog').send({ text: 'ja' });
     const sessionId = res.body.session_id;
@@ -43,16 +49,33 @@ describe('Dialog API', () => {
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'ja' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: '+49171123456' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'ja' });
+    res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'max@example.de' });
+    res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'ja' });
+    res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'Berlin' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'Ich hatte gestern einen Autounfall in Berlin.' });
     expect(res.body.case_type).toBe('traffic');
+    res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'hoch' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: '12.01.2024' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'Berlin' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'nein' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'ja' });
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'ja' });
+    res = await request(app).post('/dialog').send({ session_id: sessionId, text: '15000' });
     expect(res.body.state).toBe('SUMMARY_CONFIRM');
     res = await request(app).post('/dialog').send({ session_id: sessionId, text: 'ja' });
     expect(res.body.done).toBe(true);
     expect(res.body.state).toBe('DONE');
+  });
+
+  test('voice flow uses same dialog engine', async () => {
+    const inbound = await request(app).post('/voice/inbound').send({});
+    expect(inbound.status).toBe(200);
+    expect(inbound.text).toMatch(/<Gather/);
+
+    const gather = await request(app)
+      .post('/voice/gather')
+      .send({ SpeechResult: 'ja', CallSid: 'CA123' });
+    expect(gather.status).toBe(200);
+    expect(gather.text).toMatch(/<Response/);
   });
 });
